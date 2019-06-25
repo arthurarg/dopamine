@@ -20,6 +20,7 @@ from __future__ import print_function
 
 import os
 import sys
+import threading
 import time
 
 from dopamine.agents.dqn import dqn_agent
@@ -29,11 +30,11 @@ from dopamine.discrete_domains import atari_lib
 from dopamine.discrete_domains import checkpointer
 from dopamine.discrete_domains import iteration_statistics
 from dopamine.discrete_domains import logger
-
-import numpy as np
-import tensorflow as tf
-
+from dopamine.utils import threading_utils
 import gin.tf
+import numpy as np
+import queue
+import tensorflow as tf
 
 
 def load_gin_configs(gin_files, gin_bindings):
@@ -110,6 +111,8 @@ def create_runner(base_dir, schedule='continuous_train_and_eval'):
   # Continuously runs training until max num_iterations is hit.
   elif schedule == 'continuous_train':
     return TrainRunner(base_dir, create_agent)
+  elif schedule == 'async_train':
+    return AsyncRunner(base_dir, create_agent)
   else:
     raise ValueError('Unknown schedule: {}'.format(schedule))
 
@@ -144,7 +147,8 @@ class Runner(object):
                num_iterations=200,
                training_steps=250000,
                evaluation_steps=125000,
-               max_steps_per_episode=27000):
+               max_steps_per_episode=27000,
+               reward_clipping=(-1, 1)):
     """Initialize the Runner object in charge of running a full experiment.
 
     Args:
@@ -162,6 +166,8 @@ class Runner(object):
       evaluation_steps: int, the number of evaluation steps to perform.
       max_steps_per_episode: int, maximum number of steps after which an episode
         terminates.
+      reward_clipping: Tuple(int, int), with the minimum and maximum bounds for
+        reward at each step. If `None` no clipping is applied.
 
     This constructor will take the following actions:
     - Initialize an environment.
@@ -195,6 +201,7 @@ class Runner(object):
     self._sess.run(tf.global_variables_initializer())
 
     self._initialize_checkpointer_and_maybe_resume(checkpoint_file_prefix)
+    self._reward_clipping = reward_clipping
 
   def _create_directories(self):
     """Create necessary sub-directories."""
@@ -249,7 +256,7 @@ class Runner(object):
       action: int, the initial action chosen by the agent.
     """
     initial_observation = self._environment.reset()
-    return self._agent.begin_episode(initial_observation)
+    return self._begin_episode(initial_observation)
 
   def _run_one_step(self, action):
     """Executes a single step in the environment.
@@ -272,6 +279,12 @@ class Runner(object):
     """
     self._agent.end_episode(reward)
 
+  def _begin_episode(self, observation):
+    return self._agent.begin_episode(observation)
+
+  def _step(self, reward, observation):
+    return self._agent.step(reward, observation)
+
   def _run_one_episode(self):
     """Executes a full trajectory of the agent interacting with the environment.
 
@@ -292,7 +305,9 @@ class Runner(object):
       step_number += 1
 
       # Perform reward clipping.
-      reward = np.clip(reward, -1, 1)
+      if self._reward_clipping:
+        min_bound, max_bound = self._reward_clipping
+        reward = np.clip(reward, min_bound, max_bound)
 
       if (self._environment.game_over or
           step_number == self._max_steps_per_episode):
@@ -301,10 +316,10 @@ class Runner(object):
       elif is_terminal:
         # If we lose a life but the episode is not over, signal an artificial
         # end of episode to the agent.
-        self._agent.end_episode(reward)
-        action = self._agent.begin_episode(observation)
+        self._end_episode(reward)
+        action = self._begin_episode(observation)
       else:
-        action = self._agent.step(reward, observation)
+        action = self._step(reward, observation)
 
     self._end_episode(reward)
 
@@ -359,6 +374,7 @@ class Runner(object):
       average_reward: The average reward generated in this phase.
     """
     # Perform the training phase, during which the agent learns.
+    # TODO(#137): Replace `eval_mode` with TF ModeKeys.
     self._agent.eval_mode = False
     start_time = time.time()
     number_steps, sum_returns, num_episodes = self._run_one_phase(
@@ -415,44 +431,39 @@ class Runner(object):
         statistics)
 
     self._save_tensorboard_summaries(iteration, num_episodes_train,
-                                     average_reward_train, num_episodes_eval,
-                                     average_reward_eval)
+                                     average_reward_train, tag='Train')
+
+    self._save_tensorboard_summaries(iteration, num_episodes_eval,
+                                     average_reward_eval, tag='Eval')
     return statistics.data_lists
 
-  def _save_tensorboard_summaries(self, iteration,
-                                  num_episodes_train,
-                                  average_reward_train,
-                                  num_episodes_eval,
-                                  average_reward_eval):
+  def _save_tensorboard_summaries(self, iteration, num_episodes,
+                                  average_reward, tag):
     """Save statistics as tensorboard summaries.
 
     Args:
       iteration: int, The current iteration number.
-      num_episodes_train: int, number of training episodes run.
-      average_reward_train: float, The average training reward.
-      num_episodes_eval: int, number of evaluation episodes run.
-      average_reward_eval: float, The average evaluation reward.
+      num_episodes: int, number of training episodes run.
+      average_reward: float, The average reward.
+      tag: str, Tag to apply to Tensorboard summaries (e.g `train`, `eval`).
     """
     summary = tf.Summary(value=[
-        tf.Summary.Value(tag='Train/NumEpisodes',
-                         simple_value=num_episodes_train),
-        tf.Summary.Value(tag='Train/AverageReturns',
-                         simple_value=average_reward_train),
-        tf.Summary.Value(tag='Eval/NumEpisodes',
-                         simple_value=num_episodes_eval),
-        tf.Summary.Value(tag='Eval/AverageReturns',
-                         simple_value=average_reward_eval)
+        tf.Summary.Value(
+            tag='{}/NumEpisodes'.format(tag), simple_value=num_episodes),
+        tf.Summary.Value(
+            tag='{}/AverageReturns'.format(tag), simple_value=average_reward),
     ])
     self._summary_writer.add_summary(summary, iteration)
 
-  def _log_experiment(self, iteration, statistics):
+  def _log_experiment(self, iteration, statistics, suffix=''):
     """Records the results of the current iteration.
 
     Args:
       iteration: int, iteration number.
       statistics: `IterationStatistics` object containing statistics to log.
+      suffix: string, suffix to add to the logging key.
     """
-    self._logger['iteration_{:d}'.format(iteration)] = statistics
+    self._logger['iteration_{:d}{}'.format(iteration, suffix)] = statistics
     if iteration % self._log_every_n == 0:
       self._logger.log_to_file(self._logging_file_prefix, iteration)
 
@@ -469,6 +480,16 @@ class Runner(object):
       experiment_data['logs'] = self._logger.data
       self._checkpointer.save_checkpoint(iteration, experiment_data)
 
+  def _run_iterations(self):
+    """Runs required number of training iterations sequentially.
+
+    Statistics from each iteration are logged and exported for tensorboard.
+    """
+    for iteration in range(self._start_iteration, self._num_iterations):
+      statistics = self._run_one_iteration(iteration)
+      self._log_experiment(iteration, statistics)
+      self._checkpoint_experiment(iteration)
+
   def run_experiment(self):
     """Runs a full experiment, spread over multiple iterations."""
     tf.logging.info('Beginning training...')
@@ -477,10 +498,7 @@ class Runner(object):
                          self._num_iterations, self._start_iteration)
       return
 
-    for iteration in range(self._start_iteration, self._num_iterations):
-      statistics = self._run_one_iteration(iteration)
-      self._log_experiment(iteration, statistics)
-      self._checkpoint_experiment(iteration)
+    self._run_iterations()
 
 
 @gin.configurable
@@ -527,15 +545,139 @@ class TrainRunner(Runner):
         statistics)
 
     self._save_tensorboard_summaries(iteration, num_episodes_train,
-                                     average_reward_train)
+                                     average_reward_train, tag='Train')
     return statistics.data_lists
 
-  def _save_tensorboard_summaries(self, iteration, num_episodes,
-                                  average_reward):
-    """Save statistics as tensorboard summaries."""
-    summary = tf.Summary(value=[
-        tf.Summary.Value(tag='Train/NumEpisodes', simple_value=num_episodes),
-        tf.Summary.Value(
-            tag='Train/AverageReturns', simple_value=average_reward),
-    ])
-    self._summary_writer.add_summary(summary, iteration)
+
+# TODO(aarg): Add more details about this runner and the way thread and local
+# variables are managed. This is somewhat hidden to the user.
+@threading_utils.local_attributes(['_environment'])
+@gin.configurable
+class AsyncRunner(Runner):
+  """Defines a train runner for asynchronous training.
+
+  See `_run_one_iteration` for more details on how iterations are ran
+  asynchronously.
+  """
+
+  # TODO(aarg): Add an `eval_period` argument, mapping to `_eval_period`.
+  def __init__(
+      self, base_dir, create_agent_fn,
+      create_environment_fn=atari_lib.create_atari_environment,
+      num_simultaneous_iterations=1, **kwargs):
+    """Creates an asynchronous runner.
+
+    Args:
+      base_dir: str, the base directory to host all required sub-directories.
+      create_agent_fn: A function that takes as args a Tensorflow session and an
+        environment, and returns an agent.
+      create_environment_fn: A function which receives a problem name and
+        creates a Gym environment for that problem (e.g. an Atari 2600 game).
+      num_simultaneous_iterations: int, number of iterations running
+        simultaneously in separate threads.
+      **kwargs: Additional positional arguments.
+    """
+    threading_utils.initialize_local_attributes(
+        self, _environment=create_environment_fn)
+    self._eval_period = num_simultaneous_iterations
+    self._num_simultaneous_iterations = num_simultaneous_iterations
+    self._output_lock = threading.Lock()
+    self._training_queue = queue.Queue(num_simultaneous_iterations)
+
+    super(AsyncRunner, self).__init__(
+        base_dir=base_dir, create_agent_fn=create_agent_fn,
+        create_environment_fn=create_environment_fn, **kwargs)
+
+  def _run_iterations(self):
+    """Runs required number of training iterations sequentially.
+
+    Statistics from each iteration are logged and exported for tensorboard.
+
+    Iterations are run in multiple threads simultaneously (number of
+    simultaneous threads is specified by `num_simultaneous_iterations`). Each
+    time an iteration completes a new one starts until the right number of
+    iterations is run.
+    """
+    experience_queue = queue.Queue()
+    worker_threads = []
+
+    # TODO(aarg): Consider refactoring to use step level tasks.
+    for _ in range(self._num_simultaneous_iterations):
+      worker_threads.append(
+          threading_utils.start_worker_thread(experience_queue))
+    worker_threads.append(
+        threading_utils.start_worker_thread(self._training_queue))
+
+    # TODO(westurner): See how to refactor the code to avoid setting an internal
+    # attribute.
+    self._completed_iteration = self._start_iteration
+    for iteration in range(self._start_iteration, self._num_iterations):
+      if iteration and iteration % self._eval_period == 0:
+        # TODO(aarg): Replace with ModeKeys.
+        experience_queue.put((self._run_one_iteration, (iteration - 1, True)))
+      experience_queue.put((self._run_one_iteration, (iteration,  False)))
+    experience_queue.put(
+        (self._run_one_iteration, (self._num_iterations - 1, True)))
+
+    # Wait for all tasks to complete.
+    experience_queue.join()
+    self._training_queue.join()
+
+    # Indicate workers to stop.
+    for _ in range(self._num_simultaneous_iterations):
+      experience_queue.put(None)
+    self._training_queue.put(None)
+
+    # Wait for all running threads to complete.
+    for thread in worker_threads:
+      thread.join()
+
+  def _begin_episode(self, observation):
+    # Increments training steps and blocks if training is too slow.
+    self._enqueue_training_step()
+    return self._agent.begin_episode(observation, training=False)
+
+  def _step(self, reward, observation):
+    # Increments training steps and blocks if training is too slow.
+    self._enqueue_training_step()
+    return self._agent.step(reward, observation, training=False)
+
+  def _enqueue_training_step(self):
+    """Increments training steps to run and blocks if training is too slow.
+
+    If training is delayed, this will block episode generation until training
+    catches up. This ensures that training orccurs simultaneously to episode
+    generation with a constant training step / episode steps ratio.
+    """
+    if self._agent.eval_mode:
+      return
+    self._training_queue.put((self._agent.train_step, tuple([])))
+
+  def _run_one_iteration(self, iteration, eval_mode):
+    """Runs one iteration in separate thread, logs and checkpoints results.
+
+    Same as parent Runner implementation except that summary statistics are
+    directly logged instead of being returned.
+
+    Args:
+      iteration: int, current iteration number, used as a global_step for saving
+        Tensorboard summaries.
+      eval_mode: bool, whether this is an evaluation iteration.
+    """
+    statistics = iteration_statistics.IterationStatistics()
+    iteration_name = '{}iteration {}'.format(
+        'eval ' if eval_mode else '', iteration)
+    tf.logging.info('Starting %s.', iteration_name)
+    run_phase = self._run_eval_phase if eval_mode else self._run_train_phase
+    num_episodes, average_reward = run_phase(statistics)
+    with self._output_lock:
+      logging_iteration = iteration if eval_mode else self._completed_iteration
+      self._log_experiment(
+          logging_iteration, statistics, suffix='_eval' if eval_mode else '')
+      self._save_tensorboard_summaries(
+          logging_iteration, num_episodes, average_reward,
+          tag='Eval' if eval_mode else 'Train')
+      if not eval_mode:
+        self._checkpoint_experiment(self._completed_iteration)
+        self._completed_iteration += 1
+    tf.logging.info('Completed %s.', iteration_name)
